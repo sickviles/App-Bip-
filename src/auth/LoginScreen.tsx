@@ -7,11 +7,13 @@ import {
   ArrowRight,
   RefreshCw,
   CheckCircle2,
+  Database,
 } from 'lucide-react';
 import { formatRut, validateRut } from './utils/rut.ts';
 import { RedLogo } from './components/RedLogo.tsx';
 import { TneHelpModal } from './components/TneHelpModal.tsx';
 import { useAuth } from './AuthContext.tsx';
+import { seedUsuariosFirestore } from '../firebase/usuariosService.ts';
 
 interface FormErrors {
   rut?: string;
@@ -27,6 +29,13 @@ export const LoginScreen: React.FC = () => {
   const [serverError, setServerError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isHelpOpen, setIsHelpOpen] = useState(false);
+
+  // Estado para carga de datos de prueba en Firestore
+  const [isSeeding, setIsSeeding] = useState(false);
+  const [seedFeedback, setSeedFeedback] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
 
   // Formateo dinámico del RUT
   const handleRutChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -79,12 +88,33 @@ export const LoginScreen: React.FC = () => {
 
     setIsSubmitting(true);
 
-    // Llamada real al backend mediante AuthContext
+    // Llamada real a Firebase Firestore mediante AuthContext
     const result = await login(rut, codigoTne);
     setIsSubmitting(false);
 
     if (!result.success) {
       setServerError(result.error || 'RUT o código incorrecto');
+    }
+  };
+
+  // Cargar usuarios de prueba en Firebase Firestore
+  const handleSeedFirebase = async () => {
+    setIsSeeding(true);
+    setSeedFeedback(null);
+    try {
+      await seedUsuariosFirestore();
+      setSeedFeedback({
+        type: 'success',
+        text: '4 usuarios de prueba cargados en Firebase Firestore.',
+      });
+    } catch (error) {
+      console.error('Error al cargar datos de prueba en Firebase:', error);
+      setSeedFeedback({
+        type: 'error',
+        text: 'No se pudieron cargar los datos. Revisa las reglas de Firestore.',
+      });
+    } finally {
+      setIsSeeding(false);
     }
   };
 
@@ -279,16 +309,53 @@ export const LoginScreen: React.FC = () => {
               {/* Nota institucional de seguridad */}
               <div className="pt-2 flex items-center justify-center gap-1.5 text-[11px] text-slate-400 border-t border-slate-100">
                 <ShieldCheck className="w-3.5 h-3.5 text-slate-400" />
-                <span>Acceso protegido · Sesión segura con cookie httpOnly</span>
+                <span>Acceso protegido · Conectado a Firebase Firestore</span>
               </div>
             </form>
           </div>
         </div>
       </main>
 
-      {/* Pie de página discreto */}
+      {/* Pie de página discreto con botón para cargar datos de prueba en Firebase */}
       <footer className="w-full bg-white border-t border-slate-200 py-3 px-4 text-center text-xs text-slate-500">
-        <span>Proyecto académico – datos de prueba</span>
+        <div className="max-w-4xl mx-auto flex flex-col sm:flex-row items-center justify-center gap-2 sm:gap-4">
+          <span>Proyecto académico – datos de prueba</span>
+          <span aria-hidden="true" className="hidden sm:inline text-slate-300">·</span>
+          <button
+            type="button"
+            onClick={handleSeedFirebase}
+            disabled={isSeeding}
+            className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-500 hover:text-[#E30613] underline underline-offset-2 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isSeeding ? (
+              <>
+                <RefreshCw className="w-3 h-3 animate-spin" />
+                <span>Cargando datos de prueba...</span>
+              </>
+            ) : (
+              <>
+                <Database className="w-3 h-3" />
+                <span>Cargar datos de prueba en Firebase</span>
+              </>
+            )}
+          </button>
+        </div>
+
+        {seedFeedback && (
+          <p
+            role="status"
+            className={`mt-1.5 text-[11px] font-medium inline-flex items-center gap-1 animate-fade-in ${
+              seedFeedback.type === 'success' ? 'text-emerald-600' : 'text-red-600'
+            }`}
+          >
+            {seedFeedback.type === 'success' ? (
+              <CheckCircle2 className="w-3 h-3 shrink-0" />
+            ) : (
+              <AlertCircle className="w-3 h-3 shrink-0" />
+            )}
+            <span>{seedFeedback.text}</span>
+          </p>
+        )}
       </footer>
 
       {/* Modal de ayuda sobre el código TNE */}

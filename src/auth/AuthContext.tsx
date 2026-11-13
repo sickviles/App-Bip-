@@ -1,18 +1,28 @@
 /**
- * Módulo de Autenticación y Sesión Compartida (src/auth/AuthContext.tsx)
+ * Módulo de Autenticación y Sesión Compartida con Firebase Firestore (src/auth/AuthContext.tsx)
  *
- * Este contexto maneja la sesión del usuario a través de cookies httpOnly.
- * Tus compañeros de equipo pueden consumir `useAuth()` para saber quién está logueado,
- * ver su saldo actual o cerrar sesión.
+ * Este contexto mantiene la sesión del usuario en localStorage y escucha en tiempo real
+ * los cambios del documento en Firestore mediante `onSnapshot` (ideal para ver el saldo actualizado al instante).
+ * Tus compañeros pueden usar `useAuth()` en cualquier pantalla de src/menu/ o src/nfc/.
  */
 
 import React, { createContext, useContext, useState, useEffect } from 'react';
+import { doc, onSnapshot } from 'firebase/firestore';
+import { db } from '../firebase/config.ts';
+import {
+  getUsuarioByRutFirestore,
+  verifyTneWeb,
+  descontarSaldoFirestore,
+} from '../firebase/usuariosService.ts';
+import { cleanRut } from './utils/rut.ts';
+
+const SESSION_STORAGE_KEY = 'red_movilidad_session_rut';
 
 /**
  * Datos del usuario disponibles para toda la aplicación.
  */
 export interface User {
-  id: number;
+  id: string;
   rut: string;
   nombre: string;
   saldo: number;
@@ -20,129 +30,195 @@ export interface User {
 
 export interface AuthContextType {
   /**
-   * Usuario actualmente autenticado, o `null` si no hay sesión abierta.
+   * Usuario actualmente autenticado con datos en tiempo real desde Firestore, o `null` si no hay sesión.
    * Contiene { id, rut, nombre, saldo }.
    */
   user: User | null;
 
   /**
-   * `true` mientras el sistema verifica si existe una sesión activa previa (al cargar o recargar).
+   * `true` mientras se recupera la sesión guardada en localStorage y se conecta a Firestore.
    */
   loading: boolean;
 
   /**
-   * Inicia sesión enviando el RUT y el Código TNE al servidor.
+   * Valida el RUT y el Código TNE contra Firestore y guarda la sesión en localStorage.
    * Devuelve { success: true } si es correcto, o { success: false, error: string } si falla.
    */
   login: (rut: string, codigoTne: string) => Promise<{ success: boolean; error?: string }>;
 
   /**
-   * Cierra la sesión activa en el servidor y limpia la cookie y el estado local.
+   * Cierra la sesión actual, detiene la suscripción en tiempo real y limpia localStorage.
    */
   logout: () => Promise<void>;
+
+  /**
+   * Descuenta el valor del pasaje en Firestore usando una transacción atómica (para el módulo NFC).
+   * Devuelve { success: true, nuevoSaldo } o { success: false, error }.
+   */
+  pagarPasaje: (
+    monto: number
+  ) => Promise<{ success: boolean; nuevoSaldo?: number; error?: string }>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [activeRut, setActiveRut] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(SESSION_STORAGE_KEY);
+    } catch {
+      return null;
+    }
+  });
   const [user, setUser] = useState<User | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
+  const [loading, setLoading] = useState<boolean>(() => {
+    try {
+      return Boolean(localStorage.getItem(SESSION_STORAGE_KEY));
+    } catch {
+      return false;
+    }
+  });
 
-  // Al cargar la app, recupera la sesión activa desde el servidor (no se pierde al recargar F5)
+  // Suscripción en tiempo real con onSnapshot al documento del usuario en Firestore
   useEffect(() => {
-    let isMounted = true;
-
-    async function checkSession() {
-      try {
-        const res = await fetch('/api/me', {
-          method: 'GET',
-          credentials: 'include', // Envía la cookie httpOnly al servidor
-        });
-
-        if (res.ok) {
-          const data = (await res.json()) as User;
-          if (isMounted) setUser(data);
-        } else {
-          if (isMounted) setUser(null);
-        }
-      } catch (err) {
-        console.warn('No se pudo verificar la sesión inicial:', err);
-        if (isMounted) setUser(null);
-      } finally {
-        if (isMounted) setLoading(false);
-      }
+    if (!activeRut) {
+      setUser(null);
+      setLoading(false);
+      return;
     }
 
-    checkSession();
+    setLoading(true);
+    const userRef = doc(db, 'usuarios', activeRut);
+
+    const unsubscribe = onSnapshot(
+      userRef,
+      (docSnap) => {
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          setUser({
+            id: docSnap.id,
+            rut: String(data.rut ?? docSnap.id),
+            nombre: String(data.nombre ?? ''),
+            saldo: Number(data.saldo ?? 0),
+          });
+        } else {
+          // Si el documento ya no existe en Firestore, limpiar sesión local
+          try {
+            localStorage.removeItem(SESSION_STORAGE_KEY);
+          } catch {
+            // ignorar error de almacenamiento
+          }
+          setActiveRut(null);
+          setUser(null);
+        }
+        setLoading(false);
+      },
+      (error) => {
+        console.error('Error al escuchar sesión en Firestore:', error);
+        setLoading(false);
+      }
+    );
 
     return () => {
-      isMounted = false;
+      unsubscribe();
     };
-  }, []);
+  }, [activeRut]);
 
   /**
-   * Envía las credenciales al endpoint /api/login
+   * Inicia sesión verificando el RUT y el hash del código TNE en Firestore.
+   * Devuelve { success: true } si es válido, o { success: false, error } si falla.
    */
   const login = async (
     rut: string,
     codigoTne: string
   ): Promise<{ success: boolean; error?: string }> => {
     try {
-      const res = await fetch('/api/login', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        credentials: 'include',
-        body: JSON.stringify({ rut, codigoTne }),
-      });
+      const rutLimpio = cleanRut(rut);
+      const codigoClean = codigoTne.trim();
 
-      const data = await res.json();
-
-      if (res.ok) {
-        setUser(data as User);
-        return { success: true };
+      if (!rutLimpio || codigoClean.length < 4) {
+        return { success: false, error: 'RUT o código incorrecto' };
       }
 
+      const usuario = await getUsuarioByRutFirestore(rutLimpio);
+      if (!usuario) {
+        return { success: false, error: 'RUT o código incorrecto' };
+      }
+
+      const isMatch = await verifyTneWeb(codigoClean, usuario.codigo_tne_hash);
+      if (!isMatch) {
+        return { success: false, error: 'RUT o código incorrecto' };
+      }
+
+      try {
+        localStorage.setItem(SESSION_STORAGE_KEY, usuario.rut);
+      } catch {
+        // continuar incluso si localStorage estuviera restringido
+      }
+
+      setUser({
+        id: usuario.id,
+        rut: usuario.rut,
+        nombre: usuario.nombre,
+        saldo: usuario.saldo,
+      });
+      setActiveRut(usuario.rut);
+
+      return { success: true };
+    } catch (error) {
+      console.error('Error en login con Firestore:', error);
       return {
         success: false,
-        error: data.error || 'RUT o código incorrecto',
-      };
-    } catch {
-      return {
-        success: false,
-        error: 'Error de conexión con el servidor. Revisa si el backend está activo.',
+        error: 'No se pudo conectar con Firebase Firestore. Verifica las reglas o conexión.',
       };
     }
   };
 
   /**
-   * Envía la petición de cierre de sesión al endpoint /api/logout
+   * Cierra la sesión actual eliminando el RUT guardado en localStorage y limpiando el estado.
    */
   const logout = async (): Promise<void> => {
     try {
-      await fetch('/api/logout', {
-        method: 'POST',
-        credentials: 'include',
-      });
-    } catch (err) {
-      console.warn('Error al llamar a /api/logout:', err);
-    } finally {
-      setUser(null);
+      localStorage.removeItem(SESSION_STORAGE_KEY);
+    } catch {
+      // ignorar
+    }
+    setActiveRut(null);
+    setUser(null);
+  };
+
+  /**
+   * Descuenta un monto del saldo del usuario autenticado usando una transacción en Firestore.
+   * Devuelve { success: true, nuevoSaldo } o { success: false, error }.
+   */
+  const pagarPasaje = async (
+    monto: number
+  ): Promise<{ success: boolean; nuevoSaldo?: number; error?: string }> => {
+    if (!user) {
+      return { success: false, error: 'No hay sesión activa para realizar el pago.' };
+    }
+
+    try {
+      const { nuevoSaldo } = await descontarSaldoFirestore(user.rut, monto);
+      return { success: true, nuevoSaldo };
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'No se pudo procesar el pago del pasaje.';
+      return { success: false, error: message };
     }
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, logout }}>
+    <AuthContext.Provider value={{ user, loading, login, logout, pagarPasaje }}>
       {children}
     </AuthContext.Provider>
   );
 };
 
 /**
- * Hook para consumir la sesión en cualquier componente del proyecto.
+ * Hook para consumir la sesión y pagos en cualquier componente del proyecto.
  * Ejemplo de uso en el módulo de tus compañeros:
- * const { user, logout } = useAuth();
+ * const { user, logout, pagarPasaje } = useAuth();
  */
 export function useAuth(): AuthContextType {
   const context = useContext(AuthContext);
