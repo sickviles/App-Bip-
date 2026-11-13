@@ -1,0 +1,7 @@
+{
+  "name": "Red Movilidad - Inicio de Sesión",
+  "description": "Pantalla institucional de inicio de sesión para el sistema de transporte público Red Movilidad con autenticación de estudiante mediante RUT y tarjeta TNE.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
